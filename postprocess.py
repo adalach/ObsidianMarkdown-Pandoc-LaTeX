@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
+"""
+Post-process Pandoc LaTeX output from Obsidian Markdown.
+Converts Obsidian syntax (![[images]], [[wikilinks]]) to LaTeX, injects content
+into the template, and ensures figures are referenced from LaTeX/figures/.
+"""
 
 import argparse
 import re
+import shutil
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
+# -----------------------------------------------------------------------------
+# Injection markers: content is placed between these in main.tex
+# -----------------------------------------------------------------------------
 MARKER_START = "% === BEGIN MARKDOWN CONTENT ==="
 MARKER_END = "% === END MARKDOWN CONTENT ==="
+
+# Image paths: where to look for source images, and where they end up in LaTeX
 IMAGE_DEFAULT_ROOT = "figures"
-IMAGE_ROOTS = ("figures", "input/figures", "input/attachments", "input")
+IMAGE_ROOTS = (
+    "figures",
+    "LaTeX/figures",
+    "Markdown/attachments",
+    "Markdown",
+)
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".svg", ".pdf")
 
 # Unicode arrows that can break LaTeX compilation depending on engine/fonts.
@@ -42,25 +58,27 @@ def slugify(s: str) -> str:
 
 
 def normalize_image_path(img_path: str) -> str:
+    """
+    Resolve an image path from Markdown/attachments or Markdown to the
+    LaTeX output path. All local figures are referenced as figures/<name>.
+    """
     path = img_path.strip().strip("{}")
-    # Undo LaTeX escaping from Pandoc so we can resolve actual files.
     path = path.replace(r"\ ", " ").replace(r"\_", "_")
     path = path.replace("\\", "/")
     if path.startswith(("http://", "https://")):
         return path
     if path.startswith("/") or re.match(r"^[A-Za-z]:/", path):
         return path
-    if any(path.startswith(f"{root}/") for root in IMAGE_ROOTS):
-        return path
 
-    candidates = [f"{root}/{path}" for root in IMAGE_ROOTS]
     basename = Path(path).name
+    candidates = [f"{root}/{path}" for root in IMAGE_ROOTS]
     if basename != path:
         candidates.extend([f"{root}/{basename}" for root in IMAGE_ROOTS])
 
     for cand in candidates:
         if Path(cand).exists():
-            return cand
+            # Always output figures/<name> so LaTeX finds them in LaTeX/figures/
+            return f"{IMAGE_DEFAULT_ROOT}/{basename}"
     return f"{IMAGE_DEFAULT_ROOT}/{path}"
 
 
@@ -110,14 +128,14 @@ def make_figure_block(img_path: str, caption: str) -> str:
         "\n"
         "\\begin{figure}[htbp]\n"
         "    \\centering\n"
-        f"    \\includegraphics[width=\\textwidth]{{{img_path}}}\n"
+        f"    \\includegraphics[width=\\columnwidth]{{{img_path}}}\n"
         f"    \\caption{{{caption}.}}\n"
         f"    \\label{{fig:{label}}}\n"
         "\\end{figure}\n"
     ).strip() + "\n\n"
 
 
-def process_text(txt: str) -> str:
+def process_text(txt: str, file_slug: Optional[str] = None) -> str:
     # 1) Un-escape Pandoc's {[}{[} -> [[ and {]}{]} -> ]]
     txt = re.sub(r"\{\[\}\{\[\}", "[[", txt)
     txt = re.sub(r"\{\]\}\{\]\}", "]]", txt)
@@ -184,7 +202,10 @@ def process_text(txt: str) -> str:
             if note:
                 lab = f"{slugify(note)}--{slugify(heading)}"
             else:
-                lab = slugify(heading)
+                # [[#Heading]] same-file ref: use file_slug--heading if available
+                lab = (
+                    f"{file_slug}--{slugify(heading)}" if file_slug else slugify(heading)
+                )
         else:
             text = alias or note
             lab = slugify(note)
@@ -192,14 +213,42 @@ def process_text(txt: str) -> str:
 
     txt = LINK_PAT.sub(link_repl, txt)
 
-    # 5) Page-break before each \\section
-    txt = re.sub(r"(?m)^(\\section\{)", r"\\newpage\n\1", txt)
+    # 4b) Rewrite heading labels to include file slug for cross-references
+    if file_slug:
+
+        def rewrite_heading_label(m: re.Match) -> str:
+            lab = m.group(1)
+            if lab.startswith("fig:") or "--" in lab:
+                return m.group(0)
+            return f"\\label{{{file_slug}--{lab}}}"
+
+        txt = re.sub(r"\\label\{([^}]+)\}", rewrite_heading_label, txt)
+
+    # 4c) Remove \tightlist for normal LaTeX list spacing
+    txt = re.sub(r"\n\\tightlist\n?", "\n", txt)
+
+    # 4d) Add vertical space after lists for breathing room
+    txt = re.sub(r"(\\end\{itemize\})\s*\n", r"\1\n\\bigskip\n", txt)
+    txt = re.sub(r"(\\end\{enumerate\})\s*\n", r"\1\n\\bigskip\n", txt)
+
+    # 5) (No page-break before \\section - user prefers continuous flow)
 
     # 5b) Fix literal Markdown headings that slipped through
     txt = re.sub(r"(?m)^\\#\\#\\#\\#\s+(.+)$", r"\\paragraph{\1}", txt)
 
     # 6) Convert any longtable -> floating table + tabularx
-    table_pat = re.compile(r"(?ms)\\begin\{longtable\}.*?\\end\{longtable\}")
+    # "Table slug: caption" above table → caption before tabularx; below → caption after tabularx
+    TABLE_CAP_ABOVE = re.compile(
+        r"(?:(?:^|\n)(Table ([a-zA-Z0-9_-]+): ([^\n]+))(?:\n\s*)+)?"
+        r"(\\begin\{longtable\}.*?\\end\{longtable\})",
+        re.DOTALL,
+    )
+    TABLE_CAP_BELOW = re.compile(
+        r"(\\begin\{longtable\}.*?\\end\{longtable\})"
+        r"(?:\n\s*)+(?:^|\n)(Table ([a-zA-Z0-9_-]+): ([^\n]+))",
+        re.DOTALL,
+    )
+    table_slugs: List[str] = []
 
     def extract_braced(text: str, start: int) -> Tuple[str, int]:
         depth = 1
@@ -250,10 +299,7 @@ def process_text(txt: str) -> str:
             i += 1
         return "".join(out)
 
-    def table_repl(m):
-        block = m.group(0)
-        cap, label = extract_caption_and_label(block)
-
+    def build_table(block: str, cap: Optional[str], label: Optional[str], caption_above: bool) -> str:
         begin_idx = block.find("\\begin{longtable}")
         if begin_idx == -1:
             return block
@@ -294,19 +340,50 @@ def process_text(txt: str) -> str:
         if body and "\\bottomrule" not in body:
             body = f"{body}\n\\bottomrule"
 
-        lines = ["\\begin{table}[htbp]", "  \\centering"]
-        if cap:
+        lines = ["", "\\begin{table}[htbp]", "  \\centering"]
+        if caption_above and cap:
             lines.append(f"  \\caption{{{cap}}}")
-        if label:
-            lines.append(f"  \\label{{{label}}}")
+            if label:
+                lines.append(f"  \\label{{{label}}}")
         lines.append(f"  \\begin{{tabularx}}{{\\linewidth}}{{{prefix}{col_spec}{suffix}}}")
         if body:
             lines.append(f"    {body}")
         lines.append("  \\end{tabularx}")
+        if not caption_above and cap:
+            lines.append(f"  \\caption{{{cap}}}")
+            if label:
+                lines.append(f"  \\label{{{label}}}")
         lines.append("\\end{table}\n")
         return "\n".join(lines)
 
-    txt = table_pat.sub(table_repl, txt)
+    def table_repl_above(m):
+        cap_slug, cap_text = m.group(2), m.group(3)
+        block = m.group(4)
+        cap, label = extract_caption_and_label(block)
+        if cap_slug and cap_text:
+            table_slugs.append(cap_slug)
+            label = f"tbl:{slugify(cap_slug)}"
+            cap = cap_text.strip().rstrip(".")
+        return build_table(block, cap, label, caption_above=True)
+
+    def table_repl_below(m):
+        block = m.group(1)
+        cap_slug, cap_text = m.group(3), m.group(4)
+        table_slugs.append(cap_slug)
+        label = f"tbl:{slugify(cap_slug)}"
+        cap = cap_text.strip().rstrip(".")
+        return build_table(block, cap, label, caption_above=False)
+
+    # Process caption-below first (more specific), then caption-above
+    txt = TABLE_CAP_BELOW.sub(table_repl_below, txt)
+    txt = TABLE_CAP_ABOVE.sub(table_repl_above, txt)
+
+    # 6b) Replace "Table slug" in text with Table~\ref{tbl:slug} for known table slugs
+    for cap_slug in table_slugs:
+        lab = slugify(cap_slug)
+        # Match "Table slug" as a word (not inside other refs/labels)
+        pat = re.compile(r"(?<![\\{])\bTable " + re.escape(cap_slug) + r"\b")
+        txt = pat.sub(f"Table~\\\\ref{{tbl:{lab}}}", txt)
 
     # 7) Repair stray braces in refs, graphics & labels
     txt = re.sub(
@@ -327,6 +404,9 @@ def process_text(txt: str) -> str:
 
     # 8) Replace unicode arrows with LaTeX-safe math macros
     txt = replace_unicode_arrows(txt)
+
+    # 9) Convert display math \[ ... \] to \begin{equation} ... \end{equation} for numbering
+    txt = re.sub(r"\\\[(.*?)\\]", r"\\begin{equation}\1\\end{equation}", txt, flags=re.DOTALL)
 
     return txt
 
@@ -350,9 +430,31 @@ def fix_file(path: Path) -> None:
     print(f"Processed {path.name}")
 
 
+def copy_figures_to_latex(markdown_dir: str = "Markdown", latex_figures: str = "LaTeX/figures") -> int:
+    """
+    Copy image files from Markdown/attachments and Markdown/ to LaTeX/figures.
+    Overwrites existing files. Returns the number of files copied.
+    """
+    dest = Path(latex_figures)
+    dest.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for root_name in ("attachments", ""):
+        src_dir = Path(markdown_dir) / root_name if root_name else Path(markdown_dir)
+        if not src_dir.exists():
+            continue
+        for ext in IMAGE_EXTS:
+            for f in src_dir.glob(f"*{ext}"):
+                if f.is_file():
+                    dest_file = dest / f.name
+                    shutil.copy2(f, dest_file)
+                    count += 1
+                    print(f"  Copied {f.relative_to(markdown_dir)} -> {latex_figures}/")
+    return count
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Post-process Pandoc LaTeX output and optionally inject it."
+        description="Post-process Pandoc LaTeX output for Obsidian Markdown conversion."
     )
     parser.add_argument("--input", help="Path to the Pandoc-generated .tex file.")
     parser.add_argument("--output", help="Where to write the processed output.")
@@ -360,11 +462,32 @@ def main() -> None:
         "--template",
         help="Template .tex file to inject processed content into.",
     )
+    parser.add_argument(
+        "--copy-figures",
+        action="store_true",
+        help="Copy images from Markdown/ to LaTeX/figures before processing.",
+    )
+    parser.add_argument(
+        "--markdown",
+        help="Path to the source .md file (for resolving [[#Heading]] same-file refs).",
+    )
     args = parser.parse_args()
+
+    if args.copy_figures:
+        n = copy_figures_to_latex()
+        if n:
+            print(f"Copied {n} figure(s) to LaTeX/figures/")
+        else:
+            print("No figures found in Markdown/ or Markdown/attachments/")
+
+    file_slug = None
+    if args.markdown:
+        stem = Path(args.markdown).stem
+        file_slug = slugify(stem)
 
     if args.input:
         txt = Path(args.input).read_text(encoding="utf-8")
-        txt = process_text(txt)
+        txt = process_text(txt, file_slug=file_slug)
         if args.template:
             template_text = Path(args.template).read_text(encoding="utf-8")
             merged = inject_body(template_text, txt)

@@ -1,0 +1,10 @@
+.DS_Store
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+LaTeX/*.log
+LaTeX/*.aux
+LaTeX/*.bbl
+LaTeX/*.blg
+LaTeX/*.out
